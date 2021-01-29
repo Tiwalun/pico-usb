@@ -1,11 +1,11 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::prelude::*;
+use cortex_m::{asm::nop, prelude::*};
 use cortex_m_rt::entry;
 use panic_halt as _;
 
-use rp2040_pac::Peripherals;
+use rp2040_pac::{Peripherals, XOSC};
 
 // mod usb;
 
@@ -76,6 +76,7 @@ unsafe fn setup_chip(p: &mut rp2040_pac::Peripherals) {
             | RESETS_RESET_USBCTRL_BITS);
 
     // Write 0 to the reset field to take it out of reset
+    // TODO: Figure out which should be taken out of reset here
     p.RESETS.reset.modify(|_r, w| {
         w.busctrl().clear_bit();
         w.dma().clear_bit();
@@ -103,7 +104,232 @@ unsafe fn setup_chip(p: &mut rp2040_pac::Peripherals) {
     }
 }
 
-fn setup_clocks(p: &mut Peripherals) {}
+const XOSC_MHZ: u16 = 12;
+
+const MHZ: u32 = 1_000_000;
+
+fn enable_xosc(osc: &mut XOSC, freq_mhz: u16) {
+    // Enable external oscillator XOSC
+    osc.ctrl.write(|w| w.freq_range()._1_15mhz());
+
+    // Calculate startup delay according to section 2.16.3 of the datasheet
+    //
+    // Round up in case there is no exact value found.
+    let startup_delay = (((freq_mhz as u32 * MHZ) / 1000) + 128) / 256;
+
+    // Configure startup delay
+    unsafe {
+        osc.startup.write(|w| w.delay().bits(startup_delay as u16));
+    }
+
+    // Wait until clock is started
+
+    loop {
+        if osc.status.read().stable().bit_is_set() {
+            break;
+        }
+    }
+}
+
+/// Port of the clocks_init function from the Pico SDK
+unsafe fn clocks_init(p: &mut Peripherals) {
+    // Enable tick generation in Watchdog
+    //
+    // This is necessary to use the timer
+    p.WATCHDOG
+        .tick
+        .write(|w| w.cycles().bits(XOSC_MHZ).enable().set_bit());
+
+    // Disable resus, if it's active for some reason
+    p.CLOCKS
+        .clk_sys_resus_ctrl
+        .write(|w| w.enable().clear_bit());
+
+    // Enable external oscillator XOSC
+    enable_xosc(&mut p.XOSC, XOSC_MHZ);
+
+    // `clk_sys` and `clk_ref` must be switched from the auxiliary multiplexer (aux mux),
+    // to the glitchless mux, before changing them. (See section 2.15.3.2 in the datasheet)
+
+    // TODO: Use bitbanded register to do this atomically
+
+    // Use reference clock, not the aux mux.
+    p.CLOCKS.clk_sys_ctrl.modify(|_r, w| w.src().clk_ref());
+
+    // Wait until clock source is changed
+    while p.CLOCKS.clk_sys_selected.read().bits() != 1 {}
+
+    // TODO: Use bitbanded register to do this atomically
+
+    // Use ring oscilator (ROSC) as the clock source, not XOSC or aux
+    p.CLOCKS
+        .clk_ref_ctrl
+        .modify(|_r, w| w.src().rosc_clksrc_ph());
+
+    // Wait until clock source is changed
+    while p.CLOCKS.clk_ref_selected.read().bits() != 1 {}
+
+    // Setup PLLs
+
+    //                   REF     FBDIV VCO            POSTDIV
+    // PLL SYS: 12 / 1 = 12MHz * 125 = 1500MHZ / 6 / 2 = 125MHz
+    // PLL USB: 12 / 1 = 12MHz * 40  = 480 MHz / 5 / 2 =  48MHz
+    pll_init(&mut p.PLL_SYS, XOSC_MHZ, 1, 1500 * MHZ, 6, 2);
+
+    pll_init(&p.PLL_USB, XOSC_MHZ, 1, 480 * MHZ, 5, 2);
+
+    // configure reference clock
+    //
+    // src: 12 MHz (XOSC)
+    // dst: 12 MHz
+
+    let src_freq = 12 * MHZ;
+    let dst_freq = 12 * MHZ;
+
+    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // Set the divisor first if we increase it, to avoid overspeed.
+    if div > p.CLOCKS.clk_ref_div.read().bits() {
+        p.CLOCKS.clk_ref_div.write(|w| w.bits(div))
+    }
+
+    p.CLOCKS.clk_ref_ctrl.modify(|_r, w| w.src().xosc_clksrc());
+
+    // Set the dividor again, now it's sure to set
+    p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
+
+    // configure system clock
+    //
+    // -> should run from aux source (PLL)
+    //
+    // src: 125 MHz (pll)
+    // dst: 125 MHz
+
+    let src_freq = 125 * MHZ;
+    let dst_freq = 125 * MHZ;
+
+    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // Set the divisor first if we increase it, to avoid overspeed.
+    if div > p.CLOCKS.clk_sys_div.read().bits() {
+        p.CLOCKS.clk_sys_div.write(|w| w.bits(div))
+    }
+
+    // We would have to switch away from the aux clock source, but we know that we did that already
+    // above.
+
+    // Select PLL in aux mux
+    p.CLOCKS
+        .clk_sys_ctrl
+        .modify(|_r, w| w.auxsrc().clksrc_pll_sys());
+
+    // Select aux mux in glitchless mux
+    p.CLOCKS
+        .clk_ref_ctrl
+        .modify(|_r, w| w.src().clksrc_clk_ref_aux());
+
+    // Wait until aux mux selected
+    // Aux src has offset 1 -> bit 1
+
+    while (p.CLOCKS.clk_ref_selected.read().bits() & (1 << 1)) != (1 << 1) {}
+
+    // Set the dividor again, now it's sure to set
+    p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
+
+    // configure USB clock
+    //
+    // -> should run from aux source (PLL USB)
+    //
+    // src: 48 MHz (pll)
+    // dst: 48 MHz
+
+    let src_freq = 48 * MHZ;
+    let dst_freq = 48 * MHZ;
+
+    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // Set the divisor first if we increase it, to avoid overspeed.
+    if div > p.CLOCKS.clk_usb_div.read().bits() {
+        p.CLOCKS.clk_usb_div.write(|w| w.bits(div))
+    }
+
+    // We would have to switch away from the aux clock source, but we know that we did that already
+    // above.
+
+    // disable the clock before switching
+    p.CLOCKS.clk_usb_ctrl.modify(|_r, w| w.enable().clear_bit());
+
+    // We have to wait 3 cycles of the target clock
+    //
+    // TODO: Make this generic
+    //
+    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    nop();
+    nop();
+
+    // Select PLL in aux mux
+    p.CLOCKS
+        .clk_usb_ctrl
+        .modify(|_r, w| w.auxsrc().clksrc_pll_usb());
+
+    // Enable clock again
+    p.CLOCKS.clk_usb_ctrl.modify(|_r, w| w.enable().set_bit());
+
+    // Set the dividor again, now it's safe to set
+    p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
+}
+
+type Pll = rp2040_pac::pll_sys::RegisterBlock;
+
+fn pll_init(
+    pll: &Pll,
+    osc_freq_mhz: u16,
+    ref_div: u8,
+    vco_freq: u32,
+    post_div1: u32,
+    post_div2: u8,
+) {
+    // Turn off PLL, in case it is already running
+
+    unsafe {
+        pll.pwr.write(|w| w.bits(0xffffffff));
+    }
+
+    // Ref div divides the reference frequency
+    let ref_mhz = osc_freq_mhz as u32 / ref_div as u32;
+
+    unsafe {
+        pll.cs.write(|w| w.refdiv().bits(ref_div));
+    }
+
+    // Feedback Divide
+    //
+    let fbdiv = vco_freq / (ref_mhz * MHZ);
+
+    // TODO: additional checks for PLL params
+    assert!(fbdiv >= 16 && fbdiv <= 320);
+
+    unsafe { pll.fbdiv_int.write(|w| w.fbdiv_int().bits(fbdiv as u16)) }
+
+    pll.pwr
+        .modify(|_r, w| w.pd().clear_bit().vcopd().clear_bit());
+
+    // Wait for PLL to lock
+    while pll.cs.read().lock().bit_is_clear() {}
+
+    // Set up post dividers
+    unsafe {
+        pll.prim.write(|w| {
+            w.postdiv1()
+                .bits(post_div1 as u8)
+                .postdiv2()
+                .bits(post_div2)
+        });
+    }
+
+    // Turn on post divider
+    pll.pwr.modify(|_r, w| w.postdivpd().clear_bit());
+}
 
 #[entry]
 fn main() -> ! {
@@ -112,17 +338,65 @@ fn main() -> ! {
 
     unsafe {
         setup_chip(&mut p);
-
-        setup_clocks(&mut p);
     }
 
+    // Prepare LED
+
+    // Code from https://github.com/rp-rs/pico-blink-rs, by @thejpster
+    //
+
+    // Set GPIO25 to be an input (output enable is cleared)
+    p.SIO.gpio_oe_clr.write(|w| unsafe {
+        w.bits(1 << 25);
+        w
+    });
+
+    // Set GPIO25 to be an output low (output is cleared)
+    p.SIO.gpio_out_clr.write(|w| unsafe {
+        w.bits(1 << 25);
+        w
+    });
+
+    // Configure pin 25 for GPIO
+    p.PADS_BANK0.gpio25.write(|w| {
+        // Output Disable off
+        w.od().clear_bit();
+        // Input Enable on
+        w.ie().set_bit();
+        w
+    });
+    p.IO_BANK0.gpio25_ctrl.write(|w| {
+        // Map pin 25 to SIO
+        w.funcsel().sio_25();
+        w
+    });
+
+    // Set GPIO25 to be an output (output enable is set)
+    p.SIO.gpio_oe_set.write(|w| unsafe {
+        w.bits(1 << 25);
+        w
+    });
+
+    // -- END -- Code from https://github.com/rp-rs/pico-blink-rs, by @thejpster
+
     // Setup clocks?
+    unsafe {
+        clocks_init(&mut p);
+    }
 
     /*
     unsafe {
         usb_device_init(&mut p, &mut cp);
     }
     */
+
+    /* Enable LED to verify we get here */
+
+    // Set GPIO25 to be high
+    p.SIO.gpio_out_set.write(|w| unsafe {
+        w.bits(1 << 25);
+        w
+    });
 
     loop {
         cortex_m::asm::nop();
