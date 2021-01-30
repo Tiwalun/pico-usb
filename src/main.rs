@@ -99,7 +99,7 @@ unsafe fn setup_chip(p: &mut rp2040_pac::Peripherals) {
         w
     });
 
-    while (!p.RESETS.reset_done.read().bits() & PERIPHERALS_TO_UNRESET) != 0 {
+    while ((!p.RESETS.reset_done.read().bits()) & PERIPHERALS_TO_UNRESET) != 0 {
         cortex_m::asm::nop();
     }
 }
@@ -157,7 +157,9 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     p.CLOCKS.clk_sys_ctrl.modify(|_r, w| w.src().clk_ref());
 
     // Wait until clock source is changed
-    while p.CLOCKS.clk_sys_selected.read().bits() != 1 {}
+    while p.CLOCKS.clk_sys_selected.read().bits() != 1 {
+        nop()
+    }
 
     // TODO: Use bitbanded register to do this atomically
 
@@ -167,7 +169,9 @@ unsafe fn clocks_init(p: &mut Peripherals) {
         .modify(|_r, w| w.src().rosc_clksrc_ph());
 
     // Wait until clock source is changed
-    while p.CLOCKS.clk_ref_selected.read().bits() != 1 {}
+    while p.CLOCKS.clk_ref_selected.read().bits() != 1 {
+        nop()
+    }
 
     // Setup PLLs
 
@@ -195,7 +199,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
 
     p.CLOCKS.clk_ref_ctrl.modify(|_r, w| w.src().xosc_clksrc());
 
-    // Set the dividor again, now it's sure to set
+    // Set the dividor again, now it's safe to set
     p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
 
     // configure system clock
@@ -208,7 +212,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     let src_freq = 125 * MHZ;
     let dst_freq = 125 * MHZ;
 
-    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+    let div = (((src_freq as u64) << 8) / dst_freq as u64) as u32;
 
     // Set the divisor first if we increase it, to avoid overspeed.
     if div > p.CLOCKS.clk_sys_div.read().bits() {
@@ -225,16 +229,16 @@ unsafe fn clocks_init(p: &mut Peripherals) {
 
     // Select aux mux in glitchless mux
     p.CLOCKS
-        .clk_ref_ctrl
-        .modify(|_r, w| w.src().clksrc_clk_ref_aux());
+        .clk_sys_ctrl
+        .modify(|_r, w| w.src().clksrc_clk_sys_aux());
 
     // Wait until aux mux selected
     // Aux src has offset 1 -> bit 1
 
-    while (p.CLOCKS.clk_ref_selected.read().bits() & (1 << 1)) != (1 << 1) {}
+    while (p.CLOCKS.clk_sys_selected.read().bits() & (1 << 1)) != (1 << 1) {}
 
     // Set the dividor again, now it's sure to set
-    p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
+    p.CLOCKS.clk_sys_div.write(|w| w.bits(div));
 
     // configure USB clock
     //
@@ -276,7 +280,127 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     p.CLOCKS.clk_usb_ctrl.modify(|_r, w| w.enable().set_bit());
 
     // Set the dividor again, now it's safe to set
-    p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
+    p.CLOCKS.clk_usb_div.write(|w| w.bits(div));
+
+    // configure ADC clock
+    //
+    // -> should run from aux source (PLL USB)
+    //
+    // src: 48 MHz (pll)
+    // dst: 48 MHz
+
+    let src_freq = 48 * MHZ;
+    let dst_freq = 48 * MHZ;
+
+    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // Set the divisor first if we increase it, to avoid overspeed.
+    if div > p.CLOCKS.clk_adc_div.read().bits() {
+        p.CLOCKS.clk_adc_div.write(|w| w.bits(div))
+    }
+
+    // We would have to switch away from the aux clock source, but we know that we did that already
+    // above.
+
+    // disable the clock before switching
+    p.CLOCKS.clk_adc_ctrl.modify(|_r, w| w.enable().clear_bit());
+
+    // We have to wait 3 cycles of the target clock
+    //
+    // TODO: Make this generic
+    //
+    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    nop();
+    nop();
+
+    // Select PLL in aux mux
+    p.CLOCKS
+        .clk_adc_ctrl
+        .modify(|_r, w| w.auxsrc().clksrc_pll_usb());
+
+    // Enable clock again
+    p.CLOCKS.clk_adc_ctrl.modify(|_r, w| w.enable().set_bit());
+
+    // Set the dividor again, now it's safe to set
+    p.CLOCKS.clk_adc_div.write(|w| w.bits(div));
+
+    // configure RTC clock
+    //
+    // -> should run from aux source (PLL USB)
+    //
+    // src: 48 MHz (pll)
+    // dst: 46875 Hz
+
+    let src_freq = 48 * MHZ;
+    let dst_freq = 46875;
+
+    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // Set the divisor first if we increase it, to avoid overspeed.
+    if div > p.CLOCKS.clk_rtc_div.read().bits() {
+        p.CLOCKS.clk_rtc_div.write(|w| w.bits(div))
+    }
+
+    // We would have to switch away from the aux clock source, but we know that we did that already
+    // above.
+
+    // disable the clock before switching
+    p.CLOCKS.clk_rtc_ctrl.modify(|_r, w| w.enable().clear_bit());
+
+    // We have to wait 3 cycles of the target clock
+    //
+    // TODO: Make this generic
+    //
+    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    nop();
+    nop();
+
+    // Select PLL in aux mux
+    p.CLOCKS
+        .clk_rtc_ctrl
+        .modify(|_r, w| w.auxsrc().clksrc_pll_usb());
+
+    // Enable clock again
+    p.CLOCKS.clk_rtc_ctrl.modify(|_r, w| w.enable().set_bit());
+
+    // Set the dividor again, now it's safe to set
+    p.CLOCKS.clk_rtc_div.write(|w| w.bits(div));
+
+    // configure PERI clock
+    //
+    // -> should run from sys clk
+    //
+    // src: 48 MHz (pll)
+    // dst: 46875 Hz
+
+    let src_freq = 125 * MHZ;
+    let dst_freq = 125 * MHZ;
+
+    let _div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+
+    // No divisor for peri clk!
+
+    // We would have to switch away from the aux clock source, but we know that we did that already
+    // above.
+
+    // disable the clock before switching
+    p.CLOCKS
+        .clk_peri_ctrl
+        .modify(|_r, w| w.enable().clear_bit());
+
+    // We have to wait 3 cycles of the target clock
+    //
+    // TODO: Make this generic
+    //
+    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    nop();
+    nop();
+
+    // Select PLL in aux mux
+    p.CLOCKS.clk_peri_ctrl.modify(|_r, w| w.auxsrc().clk_sys());
+
+    // Enable clock again
+    p.CLOCKS.clk_peri_ctrl.modify(|_r, w| w.enable().set_bit());
 }
 
 type Pll = rp2040_pac::pll_sys::RegisterBlock;
@@ -331,6 +455,8 @@ fn pll_init(
     pll.pwr.modify(|_r, w| w.postdivpd().clear_bit());
 }
 
+const ALL_PERIPHERALS_UNRESET: u32 = 0x01ffffff;
+
 #[entry]
 fn main() -> ! {
     let mut p = rp2040_pac::Peripherals::take().unwrap();
@@ -338,6 +464,20 @@ fn main() -> ! {
 
     unsafe {
         setup_chip(&mut p);
+    }
+
+    // Setup clocks?
+    unsafe {
+        clocks_init(&mut p);
+    }
+
+    // Enable all peripherals
+    unsafe {
+        p.RESETS.reset.write_with_zero(|w| w.bits(0));
+
+        while ((!p.RESETS.reset_done.read().bits()) & ALL_PERIPHERALS_UNRESET) != 0 {
+            cortex_m::asm::nop();
+        }
     }
 
     // Prepare LED
@@ -378,11 +518,6 @@ fn main() -> ! {
     });
 
     // -- END -- Code from https://github.com/rp-rs/pico-blink-rs, by @thejpster
-
-    // Setup clocks?
-    unsafe {
-        clocks_init(&mut p);
-    }
 
     /*
     unsafe {
