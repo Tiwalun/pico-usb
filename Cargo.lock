@@ -142,7 +142,7 @@ dependencies = [
 [[package]]
 name = "rp2040-pac"
 version = "0.1.1"
-source = "git+https://github.com/rp-rs/rp2040-pac?branch=main#79d1b52a5d57501d95fcc7272c205025de27cbeb"
+source = "git+https://github.com/Tiwalun/rp2040-pac?branch=usb-buff-status-writable#241792892d520ef9a2d99ed2dfa50ca8a1ae2240"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",

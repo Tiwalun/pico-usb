@@ -1,13 +1,13 @@
 #![no_std]
 #![no_main]
 
-use cortex_m::{asm::nop, prelude::*};
+use cortex_m::asm::nop;
 use cortex_m_rt::entry;
 use panic_halt as _;
 
 use rp2040_pac::{Peripherals, XOSC};
 
-// mod usb;
+mod usb;
 
 #[link_section = ".boot_loader"]
 #[used]
@@ -110,12 +110,13 @@ const MHZ: u32 = 1_000_000;
 
 fn enable_xosc(osc: &mut XOSC, freq_mhz: u16) {
     // Enable external oscillator XOSC
-    osc.ctrl.write(|w| w.freq_range()._1_15mhz());
+    osc.ctrl
+        .modify(|_r, w| w.freq_range()._1_15mhz().enable().enable());
 
     // Calculate startup delay according to section 2.16.3 of the datasheet
     //
     // Round up in case there is no exact value found.
-    let startup_delay = (((freq_mhz as u32 * MHZ) / 1000) + 128) / 256;
+    let startup_delay = osc_startup_delay(freq_mhz as u32);
 
     // Configure startup delay
     unsafe {
@@ -131,6 +132,10 @@ fn enable_xosc(osc: &mut XOSC, freq_mhz: u16) {
     }
 }
 
+const fn osc_startup_delay(freq_mhz: u32) -> u32 {
+    (((freq_mhz as u32 * MHZ) / 1000) + 128) / 256
+}
+
 /// Port of the clocks_init function from the Pico SDK
 unsafe fn clocks_init(p: &mut Peripherals) {
     // Enable tick generation in Watchdog
@@ -143,7 +148,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     // Disable resus, if it's active for some reason
     p.CLOCKS
         .clk_sys_resus_ctrl
-        .write(|w| w.enable().clear_bit());
+        .modify(|_r, w| w.enable().clear_bit());
 
     // Enable external oscillator XOSC
     enable_xosc(&mut p.XOSC, XOSC_MHZ);
@@ -460,7 +465,6 @@ const ALL_PERIPHERALS_UNRESET: u32 = 0x01ffffff;
 #[entry]
 fn main() -> ! {
     let mut p = rp2040_pac::Peripherals::take().unwrap();
-    let mut cp = rp2040_pac::CorePeripherals::take().unwrap();
 
     unsafe {
         setup_chip(&mut p);
@@ -519,11 +523,10 @@ fn main() -> ! {
 
     // -- END -- Code from https://github.com/rp-rs/pico-blink-rs, by @thejpster
 
-    /*
-    unsafe {
-        usb_device_init(&mut p, &mut cp);
-    }
-    */
+    let resets = p.RESETS;
+    let usb_ctrl = p.USBCTRL_REGS;
+
+    let mut usb_device = unsafe { usb::usb_device_init(&resets, usb_ctrl) };
 
     /* Enable LED to verify we get here */
 
@@ -533,7 +536,20 @@ fn main() -> ! {
         w
     });
 
+    // Wait for USB configuration
+    while !usb_device.configured() {
+        usb_device.poll();
+    }
+
+    /* Enable LED to verify we get here */
+
+    // Set GPIO25 to be high
+    //p.SIO.gpio_out_set.write(|w| unsafe {
+    //    w.bits(1 << 25);
+    //    w
+    //});
+
     loop {
-        cortex_m::asm::nop();
+        usb_device.poll();
     }
 }
