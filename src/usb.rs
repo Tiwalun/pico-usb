@@ -602,15 +602,16 @@ pub unsafe fn usb_device_init(
     reset_control.reset.modify(|_r, w| w.usbctrl().clear_bit());
 
     // Clear previous state in DPRAM
-    // TODO!!!
+    let usb_dpram_content: *const DpramContent = USB_DPRAM as *const DpramContent;
+    // TODO: actually clear DPRAM
 
-    // Enable USB interrupt on this core
+    // Disabled, polling is used for now (Enable USB interrupt on this core)
     // cortex_m::peripheral::NVIC::unmask(Interrupt::USBCTRL_IRQ);
 
     // Mux the controller to the onboard usb phy
     usb_registers
         .usb_muxing
-        .modify(|_r, w| w.to_extphy().set_bit().softcon().set_bit());
+        .modify(|_r, w| w.to_phy().set_bit().softcon().set_bit());
 
     usb_registers.usb_pwr.write(|w| {
         w.vbus_detect()
@@ -622,24 +623,21 @@ pub unsafe fn usb_device_init(
     // Enable the USB controller in device mode
     usb_registers
         .main_ctrl
-        .write(|w| w.controller_en().set_bit());
+        .write(|w| w.controller_en().set_bit().host_ndevice().clear_bit());
 
     // Enable an interrupt per EP0 transaction
     usb_registers.sie_ctrl.write(|w| w.ep0_int_1buf().set_bit());
 
-    // -- Use polling for now
     // Enable interrupts for when a buffer is done, when the bus is reset,
     // and when a setup packet is received
-    //p.USBCTRL_REGS.inte.write(|w| {
-    //    w.buff_status()
-    //        .set_bit()
-    //        .bus_reset()
-    //        .set_bit()
-    //        .setup_req()
-    //        .set_bit()
-    //});
-
-    let usb_dpram_content: *const DpramContent = USB_DPRAM as *const DpramContent;
+    // usb_registers.inte.write(|w| {
+    //     w.buff_status()
+    //         .set_bit()
+    //         .bus_reset()
+    //         .set_bit()
+    //         .setup_req()
+    //         .set_bit()
+    // });
 
     let endpoints = [
         Some(EndpointConfig {
