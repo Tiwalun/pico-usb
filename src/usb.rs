@@ -3,7 +3,7 @@ use core::{marker::PhantomData, ops::Deref, slice};
 use vcell::VolatileCell;
 
 // USB DPRAM
-const USB_DPRAM: *const () = 0x5010_0000 as _;
+const USB_DRAM_ADDR: usize = 0x5010_0000;
 const USB_DPRAM_SIZE: usize = 4096;
 
 const USB_NUM_ENDPOINTS: usize = 16;
@@ -24,8 +24,9 @@ const USB_BUF_CTRL_DATA1_PID: u32 = 0x2000;
 const USB_BUF_CTRL_LEN_MASK: u32 = 0x3ff;
 
 // DPRAM content for a USB Device
+#[repr(C)]
 pub struct DpramContent {
-    setup_packet: [VolatileCell<u8>; 4],
+    setup_packet: [VolatileCell<u8>; 8],
     ep_ctrl: [EpCtrl; USB_NUM_ENDPOINTS - 1],
     ep_buf_ctrl: [EpCtrl; USB_NUM_ENDPOINTS],
 
@@ -53,10 +54,12 @@ impl Deref for UsbDpram {
     }
 }
 
+#[repr(C)]
 struct EpCtrl {
     in_v: VolatileCell<u32>,
     out: VolatileCell<u32>,
 }
+
 #[repr(C)]
 #[repr(packed)]
 #[allow(non_snake_case)]
@@ -230,7 +233,7 @@ const DESCRIPTOR_STRING: &[&[u8]] = &["Raspberry Pi".as_bytes(), "Pico Test Devi
 const USB_DIR_OUT: u8 = 0;
 const USB_DIR_IN: u8 = 0x80;
 
-const USB_TRANSFER_TYPE_CONTROL: u8 = 2;
+const USB_TRANSFER_TYPE_CONTROL: u8 = 0;
 const USB_TRANSFER_TYPE_BULK: u8 = 2;
 
 const USB_DT_ENDPOINT: u8 = 5;
@@ -290,11 +293,11 @@ pub struct UsbDevice {
 }
 
 impl UsbDevice {
-    fn new(config: UsbDeviceConfiguration, regs: rp2040_pac::USBCTRL_REGS) -> Self {
-        let dpram = UsbDpram {
-            _marker: PhantomData,
-        };
-
+    fn new(
+        config: UsbDeviceConfiguration,
+        regs: rp2040_pac::USBCTRL_REGS,
+        dpram: UsbDpram,
+    ) -> Self {
         Self {
             config,
             configured: false,
@@ -533,9 +536,9 @@ impl UsbDevice {
     }
 
     fn bus_reset(&mut self) {
+        // Reset device address
         self.dev_addr = 0;
         self.should_set_address = false;
-
         unsafe { self.regs.addr_endp.write_with_zero(|w| w.bits(0)) }
 
         self.configured = false;
@@ -573,11 +576,12 @@ impl UsbDevice {
     }
 }
 
+#[allow(non_snake_case)]
 struct UsbSetupPacket {
     bmRequestType: u8,
     bRequest: u8,
     wValue: u16,
-    wIndex: u16,
+    _wIndex: u16,
     wLength: u16,
 }
 
@@ -587,14 +591,14 @@ impl UsbSetupPacket {
             bmRequestType: bytes[0].get(),
             bRequest: bytes[1].get(),
             wValue: (bytes[2].get() as u16) | (bytes[3].get() as u16) << 8,
-            wIndex: (bytes[4].get() as u16) | (bytes[5].get() as u16) << 8,
+            _wIndex: (bytes[4].get() as u16) | (bytes[5].get() as u16) << 8,
             wLength: (bytes[6].get() as u16) | (bytes[7].get() as u16) << 8,
         }
     }
 }
 
 // See example in datasheet 4.1.3.2.1
-pub unsafe fn usb_device_init(
+pub fn usb_device_init(
     reset_control: &rp2040_pac::RESETS,
     usb_registers: rp2040_pac::USBCTRL_REGS,
 ) -> UsbDevice {
@@ -602,7 +606,10 @@ pub unsafe fn usb_device_init(
     reset_control.reset.modify(|_r, w| w.usbctrl().clear_bit());
 
     // Clear previous state in DPRAM
-    let usb_dpram_content: *const DpramContent = USB_DPRAM as *const DpramContent;
+
+    let dpram = UsbDpram {
+        _marker: PhantomData,
+    };
     // TODO: actually clear DPRAM
 
     // Disabled, polling is used for now (Enable USB interrupt on this core)
@@ -639,58 +646,57 @@ pub unsafe fn usb_device_init(
     //         .set_bit()
     // });
 
-    let endpoints = [
-        Some(EndpointConfig {
-            descriptor: &EP0_OUT,
-            handler: ep0_out_handler,
-            endpoint_control: None,
-            buffer_control: &(*usb_dpram_content).ep_buf_ctrl[0].out as *const _,
-            data_buffer: slice::from_raw_parts((*usb_dpram_content).ep0_buf_a.as_ptr(), 0x40),
-            next_pid: 0,
-        }),
-        Some(EndpointConfig {
-            descriptor: &EP0_IN,
-            handler: ep0_in_handler,
-            endpoint_control: None,
-            buffer_control: &(*usb_dpram_content).ep_buf_ctrl[0].in_v as *const _,
-            data_buffer: slice::from_raw_parts((*usb_dpram_content).ep0_buf_a.as_ptr(), 0x40),
+    let endpoints = unsafe {
+        [
+            Some(EndpointConfig {
+                descriptor: &EP0_OUT,
+                handler: ep0_out_handler,
+                endpoint_control: None,
+                buffer_control: &dpram.ep_buf_ctrl[0].out as *const _,
+                data_buffer: slice::from_raw_parts(dpram.ep0_buf_a.as_ptr(), 0x40),
+                next_pid: 0,
+            }),
+            Some(EndpointConfig {
+                descriptor: &EP0_IN,
+                handler: ep0_in_handler,
+                endpoint_control: None,
+                buffer_control: &dpram.ep_buf_ctrl[0].in_v as *const _,
+                data_buffer: slice::from_raw_parts(dpram.ep0_buf_a.as_ptr(), 0x40),
 
-            next_pid: 0,
-        }),
-        Some(EndpointConfig {
-            descriptor: &EP1_OUT,
-            handler: ep1_out_handler,
-            endpoint_control: Some(&(*usb_dpram_content).ep_ctrl[0].out as *const _),
-            buffer_control: &(*usb_dpram_content).ep_buf_ctrl[1].out as *const _,
-            data_buffer: slice::from_raw_parts((*usb_dpram_content).exp_data.as_ptr(), 0x40),
+                next_pid: 0,
+            }),
+            Some(EndpointConfig {
+                descriptor: &EP1_OUT,
+                handler: ep1_out_handler,
+                endpoint_control: Some(&dpram.ep_ctrl[0].out as *const _),
+                buffer_control: &dpram.ep_buf_ctrl[1].out as *const _,
+                data_buffer: slice::from_raw_parts(dpram.exp_data.as_ptr(), 0x40),
 
-            next_pid: 0,
-        }),
-        Some(EndpointConfig {
-            descriptor: &EP2_IN,
-            handler: ep2_in_handler,
-            endpoint_control: Some(&(*usb_dpram_content).ep_ctrl[1].out as *const _),
-            buffer_control: &(*usb_dpram_content).ep_buf_ctrl[2].out as *const _,
-            data_buffer: slice::from_raw_parts(
-                (*usb_dpram_content).exp_data.as_ptr().add(0x40),
-                0x40,
-            ),
+                next_pid: 0,
+            }),
+            Some(EndpointConfig {
+                descriptor: &EP2_IN,
+                handler: ep2_in_handler,
+                endpoint_control: Some(&dpram.ep_ctrl[1].in_v as *const _),
+                buffer_control: &dpram.ep_buf_ctrl[2].in_v as *const _,
+                data_buffer: slice::from_raw_parts(dpram.exp_data.as_ptr().add(0x40), 0x40),
 
-            next_pid: 0,
-        }),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ];
+                next_pid: 0,
+            }),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
+    };
 
     usb_setup_endpoints(&endpoints);
 
@@ -709,10 +715,10 @@ pub unsafe fn usb_device_init(
         .sie_ctrl
         .modify(|_r, w| w.pullup_en().set_bit());
 
-    UsbDevice::new(usb_config, usb_registers)
+    UsbDevice::new(usb_config, usb_registers, dpram)
 }
 
-unsafe fn usb_setup_endpoints(endpoints: &[Option<EndpointConfig>]) {
+fn usb_setup_endpoints(endpoints: &[Option<EndpointConfig>]) {
     for endpoint in endpoints {
         if let Some(endpoint) = endpoint {
             usb_setup_endpoint(endpoint);
@@ -724,25 +730,29 @@ const EP_CTRL_ENABLE_BITS: u32 = 1 << 31;
 const EP_CTRL_INTERRUPT_PER_BUFFER: u32 = 1 << 29;
 const EP_CTRL_BUFFER_TYPE_LSB: u32 = 26;
 
-unsafe fn usb_setup_endpoint(ep: &EndpointConfig) {
+fn usb_setup_endpoint(ep: &EndpointConfig) {
     // Not done for EP0
     if let Some(endpoint_control) = ep.endpoint_control {
         let dpram_offset = usb_buffer_offset(ep.data_buffer.as_ptr() as _);
+
         let reg = EP_CTRL_ENABLE_BITS
             | EP_CTRL_INTERRUPT_PER_BUFFER
             | ((ep.descriptor.bmAttributes as u32) << EP_CTRL_BUFFER_TYPE_LSB)
             | dpram_offset;
 
-        (*endpoint_control).set(reg);
+        unsafe {
+            (*endpoint_control).set(reg);
+        }
     }
 }
 
 fn usb_buffer_offset(dpram_pointer: *const ()) -> u32 {
     let pointer_value = dpram_pointer as u32;
 
-    pointer_value - USB_DPRAM as u32
+    pointer_value - USB_DRAM_ADDR as u32
 }
 
+#[allow(non_snake_case)]
 fn usb_prepare_string_descriptor(buffer: &mut [u8], descriptor: &[u8]) -> usize {
     let bLength = 2 + (descriptor.len() * 2);
     let bDescriptorType = 0x03;

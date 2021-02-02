@@ -183,7 +183,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     //                   REF     FBDIV VCO            POSTDIV
     // PLL SYS: 12 / 1 = 12MHz * 125 = 1500MHZ / 6 / 2 = 125MHz
     // PLL USB: 12 / 1 = 12MHz * 40  = 480 MHz / 5 / 2 =  48MHz
-    pll_init(&mut p.PLL_SYS, XOSC_MHZ, 1, 1500 * MHZ, 6, 2);
+    pll_init(&p.PLL_SYS, XOSC_MHZ, 1, 1500 * MHZ, 6, 2);
 
     pll_init(&p.PLL_USB, XOSC_MHZ, 1, 480 * MHZ, 5, 2);
 
@@ -436,7 +436,7 @@ fn pll_init(
     let fbdiv = vco_freq / (ref_mhz * MHZ);
 
     // TODO: additional checks for PLL params
-    assert!(fbdiv >= 16 && fbdiv <= 320);
+    assert!((16..=320).contains(&fbdiv));
 
     unsafe { pll.fbdiv_int.write(|w| w.fbdiv_int().bits(fbdiv as u16)) }
 
@@ -526,7 +526,7 @@ fn main() -> ! {
     let resets = p.RESETS;
     let usb_ctrl = p.USBCTRL_REGS;
 
-    let mut usb_device = unsafe { usb::usb_device_init(&resets, usb_ctrl) };
+    let mut usb_device = usb::usb_device_init(&resets, usb_ctrl);
 
     /* Enable LED to verify we get here */
 
