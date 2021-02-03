@@ -5,6 +5,8 @@ use cortex_m::asm::nop;
 use cortex_m_rt::entry;
 use panic_halt as _;
 
+use rtt_target::{rprintln, rtt_init_print};
+
 use rp2040_pac::{Peripherals, XOSC};
 
 mod usb;
@@ -109,6 +111,9 @@ const XOSC_MHZ: u16 = 12;
 const MHZ: u32 = 1_000_000;
 
 fn enable_xosc(osc: &mut XOSC, freq_mhz: u16) {
+    // Clear BADWRITE bit in status register
+    osc.status.write(|w| w.badwrite().set_bit());
+
     // Enable external oscillator XOSC
     osc.ctrl
         .modify(|_r, w| w.freq_range()._1_15mhz().enable().enable());
@@ -130,6 +135,8 @@ fn enable_xosc(osc: &mut XOSC, freq_mhz: u16) {
             break;
         }
     }
+
+    rprintln!("XOSC Status: {:#x}", osc.status.read().bits());
 }
 
 const fn osc_startup_delay(freq_mhz: u32) -> u32 {
@@ -180,6 +187,22 @@ unsafe fn clocks_init(p: &mut Peripherals) {
 
     // Setup PLLs
 
+    p.RESETS
+        .reset
+        .modify(|_r, w| w.pll_sys().set_bit().pll_usb().set_bit());
+
+    p.RESETS
+        .reset
+        .modify(|_r, w| w.pll_sys().clear_bit().pll_usb().clear_bit());
+
+    loop {
+        let reset_done = p.RESETS.reset_done.read();
+
+        if reset_done.pll_sys().bit_is_set() && reset_done.pll_usb().bit_is_set() {
+            break;
+        }
+    }
+
     //                   REF     FBDIV VCO            POSTDIV
     // PLL SYS: 12 / 1 = 12MHz * 125 = 1500MHZ / 6 / 2 = 125MHz
     // PLL USB: 12 / 1 = 12MHz * 40  = 480 MHz / 5 / 2 =  48MHz
@@ -197,12 +220,16 @@ unsafe fn clocks_init(p: &mut Peripherals) {
 
     let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
 
+    rprintln!("clock_ref: {} -> {} (div={})", src_freq, dst_freq, div);
+
     // Set the divisor first if we increase it, to avoid overspeed.
     if div > p.CLOCKS.clk_ref_div.read().bits() {
         p.CLOCKS.clk_ref_div.write(|w| w.bits(div))
     }
 
     p.CLOCKS.clk_ref_ctrl.modify(|_r, w| w.src().xosc_clksrc());
+
+    while (p.CLOCKS.clk_ref_selected.read().bits() & (1 << 2)) != (1 << 2) {}
 
     // Set the dividor again, now it's safe to set
     p.CLOCKS.clk_ref_div.write(|w| w.bits(div));
@@ -255,7 +282,9 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     let src_freq = 48 * MHZ;
     let dst_freq = 48 * MHZ;
 
-    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+    let div = clock_divider(src_freq, dst_freq);
+
+    rprintln!("clock_ref: {} -> {} (div={})", src_freq, dst_freq, div);
 
     // Set the divisor first if we increase it, to avoid overspeed.
     if div > p.CLOCKS.clk_usb_div.read().bits() {
@@ -272,7 +301,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     //
     // TODO: Make this generic
     //
-    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    // For know, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
     nop();
     nop();
 
@@ -297,7 +326,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     let src_freq = 48 * MHZ;
     let dst_freq = 48 * MHZ;
 
-    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+    let div = clock_divider(src_freq, dst_freq);
 
     // Set the divisor first if we increase it, to avoid overspeed.
     if div > p.CLOCKS.clk_adc_div.read().bits() {
@@ -314,7 +343,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     //
     // TODO: Make this generic
     //
-    // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
+    // For now, we know that the sysclock is 125 MHz, so waiting two clock cycles is enough
     nop();
     nop();
 
@@ -339,7 +368,7 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     let src_freq = 48 * MHZ;
     let dst_freq = 46875;
 
-    let div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+    let div = clock_divider(src_freq, dst_freq);
 
     // Set the divisor first if we increase it, to avoid overspeed.
     if div > p.CLOCKS.clk_rtc_div.read().bits() {
@@ -375,13 +404,8 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     //
     // -> should run from sys clk
     //
-    // src: 48 MHz (pll)
-    // dst: 46875 Hz
-
-    let src_freq = 125 * MHZ;
-    let dst_freq = 125 * MHZ;
-
-    let _div = (((src_freq << 8) as u64) / dst_freq as u64) as u32;
+    // src: 125 MHz (pll)
+    // dst: 125 MHz
 
     // No divisor for peri clk!
 
@@ -400,12 +424,18 @@ unsafe fn clocks_init(p: &mut Peripherals) {
     // For now, we now that the sysclock is 125 MHz, so waiting to clock cycles is enough
     nop();
     nop();
+    nop();
+    nop();
 
     // Select PLL in aux mux
     p.CLOCKS.clk_peri_ctrl.modify(|_r, w| w.auxsrc().clk_sys());
 
     // Enable clock again
     p.CLOCKS.clk_peri_ctrl.modify(|_r, w| w.enable().set_bit());
+}
+
+const fn clock_divider(src_freq: u32, dst_freq: u32) -> u32 {
+    (((src_freq as u64) << 8) / dst_freq as u64) as u32
 }
 
 type Pll = rp2040_pac::pll_sys::RegisterBlock;
@@ -422,6 +452,7 @@ fn pll_init(
 
     unsafe {
         pll.pwr.write(|w| w.bits(0xffffffff));
+        pll.fbdiv_int.write(|w| w.bits(0));
     }
 
     // Ref div divides the reference frequency
@@ -434,6 +465,14 @@ fn pll_init(
     // Feedback Divide
     //
     let fbdiv = vco_freq / (ref_mhz * MHZ);
+
+    rprintln!("PLL REF_MHZ: {}", ref_mhz);
+    rprintln!("PLL rev_div: {}", ref_div);
+    rprintln!("PLL fbdiv:   {}", fbdiv);
+    rprintln!(
+        "PLL Freq:    {}",
+        (osc_freq_mhz as u32 / ref_div as u32) * fbdiv / (post_div1 * post_div2 as u32)
+    );
 
     // TODO: additional checks for PLL params
     assert!((16..=320).contains(&fbdiv));
@@ -464,6 +503,8 @@ const ALL_PERIPHERALS_UNRESET: u32 = 0x01ffffff;
 
 #[entry]
 fn main() -> ! {
+    rtt_init_print!(NoBlockSkip, 4096);
+
     let mut p = rp2040_pac::Peripherals::take().unwrap();
 
     unsafe {
@@ -483,6 +524,19 @@ fn main() -> ! {
             cortex_m::asm::nop();
         }
     }
+
+    rprintln!("- Reset done");
+    rprintln!(
+        "- PLL SYS: {} kHz",
+        frequency_count_khz(&p.CLOCKS, Clock::PllSys, 12 * 1000)
+    );
+    rprintln!(
+        "- PLL USB: {} kHz",
+        frequency_count_khz(&p.CLOCKS, Clock::PllUsb, 12 * 1000)
+    );
+
+    rprintln!("CLK_USB_DIV:  {:#08x}", p.CLOCKS.clk_usb_div.read().bits());
+    rprintln!("CLK_USB_CTRL: {:#08x}", p.CLOCKS.clk_usb_ctrl.read().bits());
 
     // Prepare LED
 
@@ -528,14 +582,6 @@ fn main() -> ! {
 
     let mut usb_device = usb::usb_device_init(&resets, usb_ctrl);
 
-    /* Enable LED to verify we get here */
-
-    // Set GPIO25 to be high
-    p.SIO.gpio_out_set.write(|w| unsafe {
-        w.bits(1 << 25);
-        w
-    });
-
     // Wait for USB configuration
     while !usb_device.configured() {
         usb_device.poll();
@@ -544,12 +590,44 @@ fn main() -> ! {
     /* Enable LED to verify we get here */
 
     // Set GPIO25 to be high
-    //p.SIO.gpio_out_set.write(|w| unsafe {
-    //    w.bits(1 << 25);
-    //    w
-    //});
+    p.SIO.gpio_out_set.write(|w| unsafe {
+        w.bits(1 << 25);
+        w
+    });
 
     loop {
         usb_device.poll();
     }
+}
+
+/// Clock source for frequency counter
+enum Clock {
+    PllSys = 1,
+    PllUsb = 2,
+    Sys = 0x9,
+    Peri = 0xa,
+    Usb = 0xb,
+    Adc = 0xc,
+    Rtc = 0xd,
+}
+
+fn frequency_count_khz(clocks: &rp2040_pac::CLOCKS, src: Clock, reference_freq_khz: u32) -> u32 {
+    // Wait until Frequency counter is not running anymore
+    while clocks.fc0_status.read().running().bit_is_set() {}
+
+    unsafe {
+        clocks
+            .fc0_ref_khz
+            .modify(|r, w| w.fc0_ref_khz().bits(reference_freq_khz));
+        clocks.fc0_interval.write(|w| w.fc0_interval().bits(10));
+        clocks.fc0_min_khz.write(|w| w.fc0_min_khz().bits(0));
+        clocks.fc0_max_khz.write(|w| w.fc0_max_khz().bits(u32::MAX));
+
+        // Start measurement by selecting source clock
+        clocks.fc0_src.write(|w| w.fc0_src().bits(src as u8));
+    }
+
+    while clocks.fc0_status.read().done().bit_is_clear() {}
+
+    clocks.fc0_result.read().khz().bits()
 }
