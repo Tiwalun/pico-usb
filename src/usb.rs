@@ -248,7 +248,7 @@ const USB_DT_ENDPOINT: u8 = 5;
 
 const EP0_OUT_ADDR: u8 = USB_DIR_OUT | 0;
 const EP0_IN_ADDR: u8 = USB_DIR_IN | 0;
-const EP1_OUT_ADDR: u8 = USB_DIR_OUT | 1;
+pub const EP1_OUT_ADDR: u8 = USB_DIR_OUT | 1;
 const EP2_IN_ADDR: u8 = USB_DIR_IN | 2;
 
 static EP0_OUT: EndPointDescriptor = EndPointDescriptor {
@@ -567,7 +567,7 @@ impl UsbDevice {
         self.configured = false;
     }
 
-    fn start_transfer(&mut self, endpoint_addr: u8, len: u32, data: Option<&[u8]>) {
+    pub fn start_transfer(&mut self, endpoint_addr: u8, len: u32, data: Option<&[u8]>) {
         assert!(len <= 64);
 
         rprintln!("Transfer: EP={:02x}, len={}", endpoint_addr, len);

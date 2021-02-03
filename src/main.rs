@@ -595,6 +595,9 @@ fn main() -> ! {
         w
     });
 
+    // Start to receive data from the Host
+    usb_device.start_transfer(usb::EP1_OUT_ADDR, 64, None);
+
     loop {
         usb_device.poll();
     }
